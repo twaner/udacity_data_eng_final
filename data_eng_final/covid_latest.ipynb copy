@@ -1,0 +1,1573 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Imports"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 50,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# imports\n",
+    "import json\n",
+    "import requests\n",
+    "import pandas as pd\n",
+    "import io\n",
+    "import scipy.stats as stats# from natsort\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as pltkern\n",
+    "import configparser\n",
+    "import boto3\n",
+    "import s3fs \n",
+    "import psycopg2\n",
+    "\n",
+    "from matplotlib.ticker import FuncFormatter\n",
+    "from random import randrange\n",
+    "from sodapy import Socrata\n",
+    "from datetime import datetime\n",
+    "from matplotlib.ticker import NullFormatter, FixedLocator\n",
+    "from helpers import github_helper, build_df, inverse, forward, write_dataframe_to_parquet_on_s3, run_query, copy_to_rs#, check_s3_write\n",
+    "from sql import *"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "set env\n"
+     ]
+    }
+   ],
+   "source": [
+    "try:\n",
+    "    config = configparser.ConfigParser()\n",
+    "    config.read('config.cfg')\n",
+    "    cfg = True\n",
+    "except configparser.Error as e:\n",
+    "    print(f\"Error reading dwh.cfg: {e}\")\n",
+    "    cfg = False\n",
+    "\n",
+    "if cfg:\n",
+    "    # aws\n",
+    "    AWS_ACCESS_KEY_ID =  config.get('AWS', 'AWS_ACCESS_KEY_ID')\n",
+    "    AWS_SECRET_ACCESS_KEY = config.get('AWS', 'AWS_SECRET_ACCESS_KEY')\n",
+    "    TARGET_S3_BUCKET = config.get('S3','STAGING_DATA')\n",
+    "    IS_DEBUG = config.get('ETL','IS_DEBUG')\n",
+    "    IAM = config.get('IAM_ROLE', 'ARN2')\n",
+    "    # urls for data\n",
+    "    nyt_covid = config.get('URL', 'NYT_COVID')\n",
+    "    nyt_county_mask_url = config.get('URL', 'NYT_COUNTY_MASK')\n",
+    "    nyt_covid_counties_url = config.get('URL', 'NYT_COVID_COUNTY')\n",
+    "    # census\n",
+    "    state_population_url = config.get('URL', 'STATE_POPULATION')\n",
+    "    county_pop_url = config.get('URL', 'COUNTY_POPULATION')\n",
+    "    # TSA\n",
+    "    url = config.get('URL', 'TSA')\n",
+    "else:\n",
+    "    print(\"error reading the config file. Please investigate.\")\n",
+    "\n",
+    "print('set env')\n",
+    "# Set environ variables\n",
+    "os.environ['AWS_ACCESS_KEY_ID']= AWS_ACCESS_KEY_ID\n",
+    "os.environ['AWS_SECRET_ACCESS_KEY']= AWS_SECRET_ACCESS_KEY"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Setup cur to write to Redshift"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# connect to redshift\n",
+    "conn = False\n",
+    "cur = False\n",
+    "try:\n",
+    "    conn = psycopg2.connect(\"host={} dbname={} user={} password={} port={}\".format(*config['CLUSTER'].values()))\n",
+    "    # conn.commit = True\n",
+    "except Exception as e:\n",
+    "    print(\"Error connecting to Redshift: {}\".format(e))\n",
+    "cur = conn.cursor()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": "False"
+     },
+     "execution_count": 9,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "cur.closed"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Create Tables"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Starting  \n",
+      "CREATE TABLE IF NOT EXISTS udacity_final.states (\n",
+      "    state_fips VARCHAR(4) NOT NULL PRIMARY KEY,\n",
+      "    state VARCHAR(40) NOT NULL,\n",
+      "    population BIGINT NOT NULL\n",
+      "    )\n",
+      "    diststyle all;\n",
+      "\n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "# state population table\n",
+    "run_query(cur, conn, [states_table_create], 'create state population table')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Starting  \n",
+      "CREATE TABLE IF NOT EXISTS udacity_final.counties (\n",
+      "    county_fips VARCHAR(6) NOT NULL PRIMARY KEY,\n",
+      "    county VARCHAR(60) NOT NULL,\n",
+      "    state_fips VARCHAR(4) NOT NULL,\n",
+      "    population BIGINT NOT NULL\n",
+      "    )\n",
+      "    diststyle all;\n",
+      "\n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "run_query(cur, conn, [county_table_create], 'create county population table')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 52,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Starting  \n",
+      "CREATE TABLE IF NOT EXISTS udacity_final.state_covid (\n",
+      "    record_id varchar(32) NOT NULL PRIMARY KEY,\n",
+      "    date Varchar(30) NOT NULL,\n",
+      "    fips BIGINT NOT NULL,\n",
+      "    cases BIGINT NOT NULL,\n",
+      "    deaths BIGINT NOT NULL,\n",
+      "    cases_to_death DECIMAL NOT NULL\n",
+      "    per_capita DECIMAL NOT NULL\n",
+      "    per_hundred_thousand DECIMAL NOT NULL\n",
+      "    )\n",
+      "    diststyle all;\n",
+      "\n",
+      "Error on create state covid table: syntax error at or near \"per_capita\"\n",
+      "LINE 9:     per_capita DECIMAL NOT NULL\n",
+      "            ^\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "run_query(cur, conn, [state_covid_table_create], 'create state covid table')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 83,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Starting \n",
+      "CREATE TABLE IF NOT EXISTS udacity_final.time (\n",
+      "date DATE NOT NULL PRIMARY KEY,\n",
+      "day DECIMAL NOT NULL, \n",
+      "week DECIMAL NOT NULL, \n",
+      "month DECIMAL NOT NULL, \n",
+      "year DECIMAL NOT NULL, \n",
+      "weekday DECIMAL NOT NULL\n",
+      ")\n",
+      "diststyle all;\n",
+      "\n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "run_query(cur, conn, [time_table_create], 'create time table')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 147,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Starting  \n",
+      "CREATE TABLE IF NOT EXISTS udacity_final.county_covid (\n",
+      "    record_id varchar(32) NOT NULL PRIMARY KEY,\n",
+      "    fips BIGINT NOT NULL,\n",
+      "    cases BIGINT NOT NULL,\n",
+      "    deaths BIGINT NOT NULL,\n",
+      "    cases_to_death DECIMAL NOT NULL\n",
+      "    per_capita DECIMAL NOT NULL\n",
+      "    per_hundred_thousand DECIMAL NOT NULL\n",
+      "    )\n",
+      "    diststyle all;\n",
+      "\n",
+      "Error on create time table: syntax error at or near \"per_capita\"\n",
+      "LINE 8:     per_capita DECIMAL NOT NULL\n",
+      "            ^\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "run_query(cur, conn, [county_covid_table_create], 'create time table')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 539,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# moved to helpers\n",
+    "def to_run_query(cur, conn, queries, action=\"\"):\n",
+    "    \"\"\"\n",
+    "    Runs a list queries. An exception will be raised on all errors.\n",
+    "    Parameters:\n",
+    "    cur: a cursor object\n",
+    "    conn: a connection object\n",
+    "    queries: a list of queries\n",
+    "    action: a string that will be used in logging to show what action is happening\n",
+    "    \"\"\"\n",
+    "    if not isinstance(queries, list):\n",
+    "        tmp = list()\n",
+    "        tmp.append(queries)\n",
+    "        queries = tmp\n",
+    "    try:\n",
+    "        for query in queries:\n",
+    "            print(\"Starting {}\".format(query))\n",
+    "            cur.execute(query)\n",
+    "            conn.commit()\n",
+    "            print(f\"Commit completed\")\n",
+    "    except Exception as e:\n",
+    "        print(\"Error on {}: {}\".format(action, e))  \n",
+    "        cur.execute(\"ROLLBACK;\")\n",
+    "        conn.commit()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Build State Fact Table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "State Population DF created.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# state population df\n",
+    "state_pop_df = build_df(state_population_url, content_type='json')\n",
+    "state_build = False\n",
+    "if not state_pop_df.empty:\n",
+    "  state_build = True\n",
+    "  print(f\"State Population DF created.\")\n",
+    "else:\n",
+    "    print(f\"State Population DF failed to create.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "name\n",
+      "Index(['state_fips', 'name', 'population'], dtype='object')\n",
+      "state_fips    object\n",
+      "name          object\n",
+      "population     int64\n",
+      "dtype: object\n"
+     ]
+    }
+   ],
+   "source": [
+    "  if state_build:\n",
+    "    print(state_pop_df.head(1)[0][0].lower())\n",
+    "    # drop header row\n",
+    "    if state_pop_df[0][0].lower() == \"name\":\n",
+    "        state_pop_df.drop(state_pop_df.head(1).index, inplace = True)\n",
+    "    # set columns, sort, update index, re-order columns, and update types\n",
+    "    state_pop_df.columns = ['name', 'population', 'state_fips']\n",
+    "    state_pop_df.sort_values(by=['state_fips'], ascending=True, inplace=True)\n",
+    "    state_pop_df.reset_index(drop=True, inplace=True)\n",
+    "    state_pop_df = state_pop_df[['state_fips', 'name','population']]\n",
+    "    state_pop_df = state_pop_df.astype({\n",
+    "        'name': 'str',\n",
+    "        'population': 'int',\n",
+    "        'state_fips': 'str'\n",
+    "        })\n",
+    "\n",
+    "print(state_pop_df.columns)\n",
+    "print(state_pop_df.dtypes)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Write to S3"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Create S3 File system object"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# create s3fs system\n",
+    "try:\n",
+    "    s3 = s3fs.core.S3FileSystem(key=AWS_ACCESS_KEY_ID, secret=AWS_SECRET_ACCESS_KEY)\n",
+    "    s3.ls(path=TARGET_S3_BUCKET, details=True)\n",
+    "except Exception as e: \n",
+    "    print(\"exception creating s3fs object.\")\n",
+    "    s3 = False"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 545,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "s3.ServiceResource()\n"
+     ]
+    }
+   ],
+   "source": [
+    "# boto3 ---maybe not needed\n",
+    "s3 = boto3.resource(\n",
+    "    's3',\n",
+    "    region_name='us-east-1',\n",
+    "    aws_access_key_id=AWS_ACCESS_KEY_ID,\n",
+    "    aws_secret_access_key=AWS_SECRET_ACCESS_KEY\n",
+    ")\n",
+    "\n",
+    "# s3.Object(TARGET_S3_BUCKET, 'newfile.txt').put(Body=content)\n",
+    "# s3 = boto3.client('s3',TARGET_S3_BUCKET,aws_access_key_id=AWS_ACCESS_KEY_ID ,aws_secret_access_key=AWS_SECRET_ACCESS_KEY)\n",
+    "print(s3)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#moved to helpers\n",
+    "def to_write_dataframe_to_parquet_on_s3(dataframe, s3_bucket, folder, filename, partition=\"\"):\n",
+    "    \"\"\" Write\n",
+    "from numpy.core.fromnumeric import partitionte a dataframe to a Parquet on S3 \"\"\"\n",
+    "    print(\"Writing {} records to {}\".format(len(dataframe), filename))\n",
+    "    output_file = f\"s3://{s3_bucket}/{folder}/{filename}.parquet\"\n",
+    "    if not partition: \n",
+    "        dataframe.to_parquet(output_file)\n",
+    "    else:\n",
+    "        dataframe.to_parquet(output_file, partition_cols=[partition])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing 52 records to states\n",
+      "tmp [{'Key': 'de-final-project/staging/state_data/state_pop/states.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 22, 19, 13, tzinfo=tzutc()), 'ETag': '\"b3a295216345fef4c50a5dee31b0c89d\"', 'Size': 3946, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 3946, 'name': 'de-final-project/staging/state_data/state_pop/states.parquet'}]\n",
+      "s3 file name match\n",
+      "s3 file written\n"
+     ]
+    }
+   ],
+   "source": [
+    "# write state pop df to s3\n",
+    "state_bucket = 'state_data/state_pop'\n",
+    "state_pop_file = 'states'\n",
+    "write_dataframe_to_parquet_on_s3(state_pop_df, TARGET_S3_BUCKET,  state_bucket, state_pop_file)\n",
+    "\n",
+    "state_pop_in_s3 = False\n",
+    "state_pop_fmt = 'parquet'\n",
+    "\n",
+    "if check_s3_write(s3, TARGET_S3_BUCKET,  state_bucket, state_pop_file, state_pop_fmt):\n",
+    "    print(f\"s3 file written\")\n",
+    "    state_pop_in_s3 = True\n",
+    "else:\n",
+    "    print(f\"s3 file write error\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# move to helpers\n",
+    "def check_s3_write(s3, s3_bucket, folder , filename, file_type):\n",
+    "    s3_path = f\"{s3_bucket}/{folder}/{filename}.{file_type}\"\n",
+    "    tmp = s3.ls(path=s3_path, detail=True, refresh=False)\n",
+    "    if tmp:\n",
+    "        print(f\"tmp {tmp}\")\n",
+    "        if tmp[0]['Key'] in s3_path:\n",
+    "            print(\"s3 file name match\")\n",
+    "            return True\n",
+    "        else:\n",
+    "            print(\"NO s3 file name match\")\n",
+    "            return False\n",
+    "    else:\n",
+    "        return False"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": "'de-final-project/staging/state_data/states.parquet'"
+     },
+     "execution_count": 21,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# testt s3fs ls()\n",
+    "s3.ls(\"s3://de-final-project/staging/state_data/states.parquet\",details=True)[0]\n",
+    "tmp = s3.ls(path=s3_path, detail=True, refresh=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Write state population to RS"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 517,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# moved to helpers\n",
+    "def copy_to_rs(files, from_path, format, role):\n",
+    "    if format == 'parquet':\n",
+    "        region = \"\"\n",
+    "    else:\n",
+    "        region = f\"'us-east-1'\"\n",
+    "    copy_command = (f\"\"\"\n",
+    "    COPY {files} FROM '{from_path}'\n",
+    "    credentials 'aws_iam_role={role}'\n",
+    "        {region}\n",
+    "        format as {format}\n",
+    "        COMPUPDATE OFF \n",
+    "        STATUPDATE OFF;\n",
+    "    \"\"\")\n",
+    "    return copy_command"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "    COPY udacity_final.states FROM 's3://de-final-project/staging/state_data/state_pop'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Starting \n",
+      "    COPY udacity_final.states FROM 's3://de-final-project/staging/state_data/state_pop'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "# write state pop parquet to RS\n",
+    "target = f\"{SCHEMA}.states\".replace(\"'\",\"\")\n",
+    "from_path = TARGET_S3_BUCKET + '/' + state_bucket\n",
+    "copy_cmd = copy_to_rs(target, from_path, 'parquet', IAM)\n",
+    "print(copy_cmd)\n",
+    "\n",
+    "if state_pop_in_s3:\n",
+    "    run_query(cur, conn, [copy_cmd], \"copy states to RS\")\n",
+    "else:\n",
+    "    print(f\"state population file not written to s3, please verify.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Data quality check"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#TODO state dq check"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Build County Fact Table"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Create DF"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "County population DF created!\n"
+     ]
+    }
+   ],
+   "source": [
+    "county_pop_df = build_df(county_pop_url, content_type='json')\n",
+    "county_build = False\n",
+    "if not county_pop_df.empty:\n",
+    "    print('County population DF created!')\n",
+    "    county_build = True\n",
+    "else:\n",
+    "    print('County population DF failed to create')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "name\n"
+     ]
+    }
+   ],
+   "source": [
+    "# drop the header row from the file; set column names and cleanup data\n",
+    "if county_build:\n",
+    "    print(county_pop_df.head(1)[0][0].lower())# drop header row\n",
+    "    if county_pop_df[0][0].lower() == \"name\":\n",
+    "        county_pop_df.drop(county_pop_df.head(1).index, inplace = True)\n",
+    "    county_pop_df.columns = ['NAME', 'population', 'state_fips', 'fips']\n",
+    "    \n",
+    "    county_pop_df['fips'] = county_pop_df.state_fips + county_pop_df.fips\n",
+    "    county_pop_df['county'] = county_pop_df['NAME'].str.split(r'\\s*( County)\\W*').str[0]  \n",
+    "    county_pop_df.drop('NAME', axis = 1, inplace = True)\n",
+    "    # reorder\n",
+    "    county_pop_df.sort_values(by=['fips', 'state_fips'], ascending=[True, True], inplace=True)\n",
+    "    county_pop_df.reset_index(drop=True, inplace=True)\n",
+    "    county_pop_df = county_pop_df[['fips', 'county', 'state_fips', 'population']]\n",
+    "    # update the types to int64 and str\n",
+    "    # county_pop_df.set_index('fips', inplace=True)\n",
+    "    county_pop_df = county_pop_df.astype({\n",
+    "    'population': 'int64',\n",
+    "    'state_fips': 'str',\n",
+    "    'county': 'str',\n",
+    "    'fips': 'str'\n",
+    "    })"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Write to RS"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing 3220 records to counties\n",
+      "tmp [{'Key': 'de-final-project/staging/county_data/county_pop/counties.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 22, 22, 55, tzinfo=tzutc()), 'ETag': '\"3b15c1d1ed0257f3a1a62b89f0ebd6d5\"', 'Size': 61103, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 61103, 'name': 'de-final-project/staging/county_data/county_pop/counties.parquet'}]\n",
+      "s3 file name match\n",
+      "s3 file written\n"
+     ]
+    }
+   ],
+   "source": [
+    "county_bucket = 'county_data/county_pop'\n",
+    "county_file = 'counties'\n",
+    "write_dataframe_to_parquet_on_s3(county_pop_df, TARGET_S3_BUCKET, county_bucket ,county_file)\n",
+    "\n",
+    "if check_s3_write(s3, TARGET_S3_BUCKET, county_bucket ,county_file, 'parquet'):\n",
+    "    print(f\"s3 file written\")\n",
+    "else:\n",
+    "    print(f\"s3 file write error\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 78,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "tmp [{'Key': 'de-final-project/staging/county_data/county_pop/counties.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 22, 22, 55, tzinfo=tzutc()), 'ETag': '\"3b15c1d1ed0257f3a1a62b89f0ebd6d5\"', 'Size': 61103, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 61103, 'name': 'de-final-project/staging/county_data/county_pop/counties.parquet'}]\n",
+      "s3 file name match\n",
+      "s3 file written\n",
+      "\n",
+      "    COPY udacity_final.states FROM 's3://de-final-project/staging/state_data/state_pop'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Starting \n",
+      "    COPY udacity_final.counties FROM 's3://de-final-project/staging/county_data/county_pop'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "county_pop_in_s3 = False\n",
+    "county_fmt = 'parquet'\n",
+    "\n",
+    "if check_s3_write(s3, TARGET_S3_BUCKET,  county_bucket, county_file, county_fmt):\n",
+    "    print(f\"s3 file written\")\n",
+    "    county_pop_in_s3 = True\n",
+    "else:\n",
+    "    print(f\"s3 file write error\")\n",
+    "\n",
+    "if county_pop_in_s3:\n",
+    "    pass\n",
+    "else:\n",
+    "    print(f\"cannot COPY {county_file} to Redshift, the files cannot be found on s3. Please verify\")\n",
+    "\n",
+    "county_target = f\"{SCHEMA}.counties\".replace(\"'\",\"\")\n",
+    "\n",
+    "county_from_path = TARGET_S3_BUCKET + '/' + county_bucket\n",
+    "county_copy_cmd = copy_to_rs(county_target, county_from_path, 'parquet', IAM)\n",
+    "print(copy_cmd)\n",
+    "if county_pop_in_s3:\n",
+    "\n",
+    "    run_query(cur, conn, [county_copy_cmd], \"copy states to RS\")\n",
+    "else:\n",
+    "    print(f\"state population file not written to s3, please verify.\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* County pop data check"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#TODO county pop data check"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "State Level Covid Data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Create state covid data frame"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 71,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# create NYT Covid data frame\n",
+    "nyt_covid_request_df = github_helper(nyt_covid, 'csv')\n",
+    "if nyt_covid_request_df.empty:\n",
+    "  print(f\"Covid data request failed to create a data frame, please try again.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 72,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Index(['date', 'state', 'fips', 'cases', 'deaths', 'case_to_death'], dtype='object')\n"
+     ]
+    }
+   ],
+   "source": [
+    "# set date to datetime format; add cases to death ratio\n",
+    "nyt_covid_request_df['date'] = pd.to_datetime(nyt_covid_request_df['date'], format = '%Y-%m-%d')\n",
+    "nyt_covid_request_df['case_to_death'] = nyt_covid_request_df['deaths'] / nyt_covid_request_df['cases']\n",
+    "print(nyt_covid_request_df.columns)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 73,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# drop state name, to use fips as FK, re-order table by date and FIPS\n",
+    "nyt_covid_request_df.drop('state', axis = 1, inplace = True)\n",
+    "nyt_covid_request_df.sort_values(by=['date', 'fips'], ascending=[True, True], inplace=True)\n",
+    "nyt_covid_request_df.reset_index(drop=True, inplace=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Write to S3"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 74,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing 17669 records to state_covid\n",
+      "tmp [{'Key': 'de-final-project/staging/state_data/state_covid/state_covid.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 22, 35, 33, tzinfo=tzutc()), 'ETag': '\"4ce28d8b0a49bfc62c8ca769191a3183\"', 'Size': 419273, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 419273, 'name': 'de-final-project/staging/state_data/state_covid/state_covid.parquet'}]\n",
+      "s3 file name match\n",
+      "s3 file written\n"
+     ]
+    }
+   ],
+   "source": [
+    "nyt_state_bucket = 'state_data/state_covid'\n",
+    "nyt_state_file = 'state_covid'\n",
+    "state_covid_in_s3 = False\n",
+    "write_dataframe_to_parquet_on_s3( nyt_covid_request_df, TARGET_S3_BUCKET, nyt_state_bucket ,nyt_state_file)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Write to state covid data to RS"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 77,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "tmp [{'Key': 'de-final-project/staging/state_data/state_covid/state_covid.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 22, 35, 33, tzinfo=tzutc()), 'ETag': '\"4ce28d8b0a49bfc62c8ca769191a3183\"', 'Size': 419273, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 419273, 'name': 'de-final-project/staging/state_data/state_covid/state_covid.parquet'}]\n",
+      "s3 file name match\n",
+      "s3 file written\n",
+      "\n",
+      "    COPY udacity_final.state_covid FROM 's3://de-final-project/staging/state_data/state_covid'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Starting \n",
+      "    COPY udacity_final.state_covid FROM 's3://de-final-project/staging/state_data/state_covid'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "if check_s3_write(s3, TARGET_S3_BUCKET,  nyt_state_bucket, nyt_state_file, 'parquet'):\n",
+    "    state_covid_target = f\"{SCHEMA}.state_covid\".replace(\"'\",\"\")\n",
+    "\n",
+    "    state_covid_from_path = TARGET_S3_BUCKET + '/' + nyt_state_bucket\n",
+    "    state_covid_copy_cmd = copy_to_rs(state_covid_target, state_covid_from_path, 'parquet', IAM)\n",
+    "    print(state_covid_copy_cmd)\n",
+    "    if state_covid_in_s3:\n",
+    "        run_query(cur, conn, [state_covid_copy_cmd], \"copy states to RS\")\n",
+    "    else:\n",
+    "        print(f\"state population file not written to s3, please verify.\")\n",
+    "else:\n",
+    "    print(f\"cannot COPY {nyt_state_file} to Redshift, the files cannot be found on s3. Please verify\")\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Date Fact Table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 87,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "date_df = pd.DataFrame()\n",
+    "date_df['date'] = pd.to_datetime(pd.unique(nyt_covid_request_df['date']),format = '%Y-%m-%d')\n",
+    "date_df['year'] = pd.DatetimeIndex(date_df['date']).year\n",
+    "date_df['month'] = pd.DatetimeIndex(date_df['date']).month\n",
+    "date_df['day'] = pd.DatetimeIndex(date_df['date']).day\n",
+    "date_df['weekday'] = pd.DatetimeIndex(date_df['date']).weekday\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Write to Date Fact Table to S3"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 88,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing 363 records to dates\n",
+      "tmp [{'Key': 'de-final-project/staging/date/dates.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 23, 31, 11, tzinfo=tzutc()), 'ETag': '\"af1dc1d0d9c17c8f43dcaf978ede6637\"', 'Size': 6850, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 6850, 'name': 'de-final-project/staging/date/dates.parquet'}]\n",
+      "s3 file name match\n",
+      "s3 file written\n"
+     ]
+    }
+   ],
+   "source": [
+    "date_bucket = 'date'\n",
+    "date_file = 'dates'\n",
+    "write_dataframe_to_parquet_on_s3( date_df, TARGET_S3_BUCKET, date_bucket ,date_file)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Write date file to Redshift"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 92,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "tmp [{'Key': 'de-final-project/staging/date/dates.parquet', 'LastModified': datetime.datetime(2021, 1, 18, 23, 31, 11, tzinfo=tzutc()), 'ETag': '\"af1dc1d0d9c17c8f43dcaf978ede6637\"', 'Size': 6850, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 6850, 'name': 'de-final-project/staging/date/dates.parquet'}]\n",
+      "s3 file name match\n",
+      "\n",
+      "    COPY udacity_final.state_covid FROM 's3://de-final-project/staging/udacity_final.state_covid'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Starting \n",
+      "    COPY udacity_final.state_covid FROM 's3://de-final-project/staging/udacity_final.state_covid'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Commit completed\n"
+     ]
+    }
+   ],
+   "source": [
+    "if check_s3_write(s3, TARGET_S3_BUCKET, date_bucket ,date_file, 'parquet'):\n",
+    "    date_target = f\"{SCHEMA}.state_covid\".replace(\"'\",\"\")\n",
+    "    date_target_from_path = TARGET_S3_BUCKET + '/' + date_target\n",
+    "    date_target_copy_cmd = copy_to_rs(date_target, date_target_from_path, 'parquet', IAM)\n",
+    "    run_query(cur, conn, [date_target_copy_cmd], \"copy states to RS\")\n",
+    "else:\n",
+    "    print(f\"cannot COPY {nyt_state_file} to Redshift, the files cannot be found on s3. Please verify\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "County Level Covid Data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 210,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "County DataFrame created\n",
+      "len: 939988 \n",
+      "columns: Index(['date', 'county', 'state', 'fips', 'cases', 'deaths'], dtype='object')\n"
+     ]
+    }
+   ],
+   "source": [
+    "# createt nyt covid county df\n",
+    "nyt_covid_county_df = github_helper(nyt_covid_counties_url, 'csv')\n",
+    "if not nyt_covid_county_df.empty:\n",
+    "      print(f\"County DataFrame created\")\n",
+    "else:\n",
+    "    print(f\"County DataFrame failed to create.\")\n",
+    "print(f\"len: {len(nyt_covid_county_df.index)} \\ncolumns: {nyt_covid_county_df.columns}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 211,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "date       county       state     fips  cases  deaths\n",
+      "0  2020-01-21    Snohomish  Washington  53061.0      1     0.0\n",
+      "1  2020-01-22    Snohomish  Washington  53061.0      1     0.0\n",
+      "2  2020-01-23    Snohomish  Washington  53061.0      1     0.0\n",
+      "3  2020-01-24         Cook    Illinois  17031.0      1     0.0\n",
+      "4  2020-01-24    Snohomish  Washington  53061.0      1     0.0\n",
+      "5  2020-01-25       Orange  California   6059.0      1     0.0\n",
+      "6  2020-01-25         Cook    Illinois  17031.0      1     0.0\n",
+      "7  2020-01-25    Snohomish  Washington  53061.0      1     0.0\n",
+      "8  2020-01-26     Maricopa     Arizona   4013.0      1     0.0\n",
+      "9  2020-01-26  Los Angeles  California   6037.0      1     0.0\n"
+     ]
+    },
+    {
+     "data": {
+      "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>date</th>\n      <th>county</th>\n      <th>state</th>\n      <th>fips</th>\n      <th>cases</th>\n      <th>deaths</th>\n      <th>county_fips</th>\n      <th>corrected_fips</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>2020-01-21</td>\n      <td>Snohomish</td>\n      <td>Washington</td>\n      <td>53061.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>53061.0</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>2020-01-22</td>\n      <td>Snohomish</td>\n      <td>Washington</td>\n      <td>53061.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>53061.0</td>\n      <td>53061.0</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>2020-01-23</td>\n      <td>Snohomish</td>\n      <td>Washington</td>\n      <td>53061.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>53061.0</td>\n      <td>53061.0</td>\n    </tr>\n    <tr>\n      <th>3</th>\n      <td>2020-01-24</td>\n      <td>Cook</td>\n      <td>Illinois</td>\n      <td>17031.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>17031.0</td>\n      <td>17031.0</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>2020-01-24</td>\n      <td>Snohomish</td>\n      <td>Washington</td>\n      <td>53061.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>53061.0</td>\n    </tr>\n    <tr>\n      <th>5</th>\n      <td>2020-01-25</td>\n      <td>Orange</td>\n      <td>California</td>\n      <td>6059.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>6059.0</td>\n    </tr>\n    <tr>\n      <th>6</th>\n      <td>2020-01-25</td>\n      <td>Cook</td>\n      <td>Illinois</td>\n      <td>17031.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>17031.0</td>\n    </tr>\n    <tr>\n      <th>7</th>\n      <td>2020-01-25</td>\n      <td>Snohomish</td>\n      <td>Washington</td>\n      <td>53061.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>53061.0</td>\n    </tr>\n    <tr>\n      <th>8</th>\n      <td>2020-01-26</td>\n      <td>Maricopa</td>\n      <td>Arizona</td>\n      <td>4013.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>4013.0</td>\n    </tr>\n    <tr>\n      <th>9</th>\n      <td>2020-01-26</td>\n      <td>Los Angeles</td>\n      <td>California</td>\n      <td>6037.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>NaN</td>\n      <td>6037.0</td>\n    </tr>\n  </tbody>\n</table>\n</div>",
+      "text/plain": "         date       county       state     fips  cases  deaths  county_fips  \\\n0  2020-01-21    Snohomish  Washington  53061.0      1     0.0          NaN   \n1  2020-01-22    Snohomish  Washington  53061.0      1     0.0      53061.0   \n2  2020-01-23    Snohomish  Washington  53061.0      1     0.0      53061.0   \n3  2020-01-24         Cook    Illinois  17031.0      1     0.0      17031.0   \n4  2020-01-24    Snohomish  Washington  53061.0      1     0.0          NaN   \n5  2020-01-25       Orange  California   6059.0      1     0.0          NaN   \n6  2020-01-25         Cook    Illinois  17031.0      1     0.0          NaN   \n7  2020-01-25    Snohomish  Washington  53061.0      1     0.0          NaN   \n8  2020-01-26     Maricopa     Arizona   4013.0      1     0.0          NaN   \n9  2020-01-26  Los Angeles  California   6037.0      1     0.0          NaN   \n\n   corrected_fips  \n0         53061.0  \n1         53061.0  \n2         53061.0  \n3         17031.0  \n4         53061.0  \n5          6059.0  \n6         17031.0  \n7         53061.0  \n8          4013.0  \n9          6037.0  "
+     },
+     "execution_count": 211,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "print(nyt_covid_county_df.head(10))\n",
+    "nyt_covid_county_df.fips.astype(str).str.split('.', expand = True)[0]\n",
+    "# if len(nyt_covid_county_df.fips) == 5:\n",
+    "#     print(\"hello\")\n",
+    "\n",
+    "# df = df.assign(Product=lambda x: (x['Field_1'] * x['Field_2'] * x['Field_3'])) \n",
+    "nyt_covid_county_df = nyt_covid_county_df.assign(county_fips= lambda x: (x['fips'][2:5] if len(x['fips']) == 6 else x['fips'][1:4]))\n",
+    "nyt_covid_county_df = nyt_covid_county_df.assign(corrected_fips=lambda x: (\"0\" + str(x['fips']) if len(str(x['fips'])) < 6 else x['fips']))\n",
+    "nyt_covid_county_df.head(10)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 189,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# update data\n",
+    "nyt_covid_county_df['date'] = pd.to_datetime(nyt_covid_county_df['date'], format = '%Y-%m-%d')\n",
+    "nyt_covid_county_df['case_to_death'] = nyt_covid_county_df['deaths'] / nyt_covid_county_df['cases']\n",
+    "nyt_covid_county_df.drop(['county','state'], axis = 1, inplace = True)\n",
+    "\n",
+    "nyt_covid_county_df = nyt_covid_county_df[['date', 'fips', 'cases', 'deaths', 'case_to_death']]\n",
+    "nyt_covid_county_df.fips.fillna(0,inplace=True)\n",
+    "nyt_covid_county_df.deaths.fillna(0, inplace=True)\n",
+    "nyt_covid_county_df.fips = nyt_covid_county_df.fips.astype(str).str.split('.', expand = True)[0]\n",
+    "nyt_covid_county_df = nyt_covid_county_df.astype({\n",
+    "'deaths': 'int'\n",
+    "})\n",
+    "nyt_covid_county_df.sort_values(by=['date','fips'], ascending=[True, True], inplace=True)\n",
+    "nyt_covid_county_df.reset_index(drop=True, inplace=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 191,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>date</th>\n      <th>fips</th>\n      <th>cases</th>\n      <th>deaths</th>\n      <th>case_to_death</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>2020-01-21</td>\n      <td>53061</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>2020-01-22</td>\n      <td>53061</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>2020-01-23</td>\n      <td>53061</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>3</th>\n      <td>2020-01-24</td>\n      <td>17031</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>2020-01-24</td>\n      <td>53061</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>5</th>\n      <td>2020-01-25</td>\n      <td>6059</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>6</th>\n      <td>2020-01-25</td>\n      <td>17031</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>7</th>\n      <td>2020-01-25</td>\n      <td>53061</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>8</th>\n      <td>2020-01-26</td>\n      <td>4013</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>9</th>\n      <td>2020-01-26</td>\n      <td>6037</td>\n      <td>1</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n  </tbody>\n</table>\n</div>",
+      "text/plain": "        date   fips  cases  deaths  case_to_death\n0 2020-01-21  53061      1       0            0.0\n1 2020-01-22  53061      1       0            0.0\n2 2020-01-23  53061      1       0            0.0\n3 2020-01-24  17031      1       0            0.0\n4 2020-01-24  53061      1       0            0.0\n5 2020-01-25   6059      1       0            0.0\n6 2020-01-25  17031      1       0            0.0\n7 2020-01-25  53061      1       0            0.0\n8 2020-01-26   4013      1       0            0.0\n9 2020-01-26   6037      1       0            0.0"
+     },
+     "execution_count": 191,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "nyt_covid_county_df.fips = nyt_covid_county_df.fips.astype(str).str.split('.', expand = True)[0]\n",
+    "nyt_covid_county_df.head(10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Write to S3"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 179,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing 939988 records to county_covid\n"
+     ]
+    }
+   ],
+   "source": [
+    "# write county date to s3\n",
+    "covid_county_bucket = 'county_data/county_covid'\n",
+    "covid_county_file = 'county_covid'\n",
+    "write_dataframe_to_parquet_on_s3(nyt_covid_county_df, TARGET_S3_BUCKET, covid_county_bucket ,covid_county_file)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "* Write County Covid data to Redshift"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 180,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "tmp [{'Key': 'de-final-project/staging/county_data/county_covid/county_covid.parquet', 'LastModified': datetime.datetime(2021, 1, 19, 0, 10, 16, tzinfo=tzutc()), 'ETag': '\"926c45ccd02a832a73efb57c6829cef0-2\"', 'Size': 10615930, 'StorageClass': 'STANDARD', 'type': 'file', 'size': 10615930, 'name': 'de-final-project/staging/county_data/county_covid/county_covid.parquet'}]\n",
+      "s3 file name match\n",
+      "\n",
+      "    COPY udacity_final.county_covid FROM 's3://de-final-project/staging/county_data/county_covid'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Starting \n",
+      "    COPY udacity_final.county_covid FROM 's3://de-final-project/staging/county_data/county_covid'\n",
+      "    credentials 'aws_iam_role=arn:aws:iam::592934352553:role/dwh_IAM_Role'\n",
+      "        \n",
+      "        format as parquet\n",
+      "        COMPUPDATE OFF \n",
+      "        STATUPDATE OFF;\n",
+      "    \n",
+      "Error on copy states to RS: Spectrum Scan Error\n",
+      "DETAIL:  \n",
+      "  -----------------------------------------------\n",
+      "  error:  Spectrum Scan Error\n",
+      "  code:      15001\n",
+      "  context:   File 'https://s3.us-east-1.amazonaws.com/de-final-project/staging/county_data/county_covid/county_covid.parquet  has an incompatible Parquet schema for column 's3://de-final-project/staging/county_data/county_covid.fips'. Column type: BIGINT, Parquet schem\n",
+      "  query:     2845\n",
+      "  location:  dory_util.cpp:945\n",
+      "  process:   fetchtask_thread [pid=20076]\n",
+      "  -----------------------------------------------\n",
+      "\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "# write covid county to rs\n",
+    "if check_s3_write(s3, TARGET_S3_BUCKET, covid_county_bucket , covid_county_file, 'parquet'):\n",
+    "    county_target = f\"{SCHEMA}.county_covid\".replace(\"'\",\"\")\n",
+    "    county_target_from_path = TARGET_S3_BUCKET + '/' + covid_county_bucket\n",
+    "    county_target_copy_cmd = copy_to_rs(county_target, county_target_from_path, 'parquet', IAM)\n",
+    "    print(county_target_copy_cmd)\n",
+    "    run_query(cur, conn, [county_target_copy_cmd], \"copy states to RS\")\n",
+    "else:\n",
+    "    print(f\"cannot COPY {covid_county_file} to Redshift, the files cannot be found on s3. Please verify\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# tmp_df.head(10)\n",
+    "# pd.pivot_table(tmp_df, values='cases', index=['date'], columns=['fips','cases','deaths'], aggfunc=np.sum, fill_value=0)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 261,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Writing 933498 records to covid_county\n",
+      "s3 file write error\n"
+     ]
+    }
+   ],
+   "source": [
+    "county_covid_bucket = 'county_data'\n",
+    "county_covid_file = 'covid_county'\n",
+    "write_dataframe_to_parquet_on_s3(nyt_covid_county_df, TARGET_S3_BUCKET, county_covid_bucket ,county_covid_file)\n",
+    "\n",
+    "if check_s3_write(s3, TARGET_S3_BUCKET, county_covid_bucket ,county_covid_file, 'parquet'):\n",
+    "    print(f\"s3 file written\")\n",
+    "else:\n",
+    "    print(f\"s3 file write error\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Index(['date', 'county', 'state', 'fips', 'cases', 'deaths', 'case_to_death'], dtype='object')\n"
+     ]
+    }
+   ],
+   "source": [
+    "nyt_covid_county_df.head(5)\n",
+    "\n",
+    "\n",
+    "# set cases to death ratio\n",
+    "nyt_covid_county_df['case_to_death'] = nyt_covid_county_df['deaths'] / nyt_covid_county_df['cases']\n",
+    "print(nyt_covid_county_df.columns)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "date     county       state     fips  cases  deaths  case_to_death  \\\n",
+      "0  2020-01-21  Snohomish  Washington  53061.0      1     0.0            0.0   \n",
+      "\n",
+      "   COUNTYFP  NEVER  RARELY  SOMETIMES  FREQUENTLY  ALWAYS  \n",
+      "0     53061  0.017   0.014      0.056       0.191   0.721  \n",
+      "Index(['date', 'county', 'state', 'fips', 'cases', 'deaths', 'case_to_death',\n",
+      "       'COUNTYFP', 'NEVER', 'RARELY', 'SOMETIMES', 'FREQUENTLY', 'ALWAYS'],\n",
+      "      dtype='object')\n",
+      "Index(['date', 'county', 'state', 'fips', 'cases', 'deaths', 'case_to_death',\n",
+      "       'NEVER', 'RARELY', 'SOMETIMES', 'FREQUENTLY', 'ALWAYS'],\n",
+      "      dtype='object')\n"
+     ]
+    }
+   ],
+   "source": [
+    "#merge mask data into county\n",
+    "#TODO mask data to its own table\n",
+    "merged_county_df = pd.merge(left = nyt_covid_county_df, right = nyt_county_mask_df, left_on = 'fips', right_on = 'COUNTYFP')\n",
+    "\n",
+    "print(merged_county_df.head(1))\n",
+    "\n",
+    "print(merged_county_df.columns)\n",
+    "# remove duplicate column\n",
+    "merged_county_df.drop(['COUNTYFP'], axis = 1, inplace = True)\n",
+    "\n",
+    "print(merged_county_df.columns)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>date</th>\n      <th>county</th>\n      <th>state</th>\n      <th>fips</th>\n      <th>cases</th>\n      <th>deaths</th>\n      <th>case_to_death</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>824</th>\n      <td>2020-03-08</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>0.000000</td>\n    </tr>\n    <tr>\n      <th>951</th>\n      <td>2020-03-09</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>0.000000</td>\n    </tr>\n    <tr>\n      <th>1102</th>\n      <td>2020-03-10</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>1</td>\n      <td>0.0</td>\n      <td>0.000000</td>\n    </tr>\n    <tr>\n      <th>1289</th>\n      <td>2020-03-11</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>2</td>\n      <td>0.0</td>\n      <td>0.000000</td>\n    </tr>\n    <tr>\n      <th>1526</th>\n      <td>2020-03-12</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>4</td>\n      <td>0.0</td>\n      <td>0.000000</td>\n    </tr>\n    <tr>\n      <th>...</th>\n      <td>...</td>\n      <td>...</td>\n      <td>...</td>\n      <td>...</td>\n      <td>...</td>\n      <td>...</td>\n      <td>...</td>\n    </tr>\n    <tr>\n      <th>912678</th>\n      <td>2021-01-09</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>6677</td>\n      <td>165.0</td>\n      <td>0.024712</td>\n    </tr>\n    <tr>\n      <th>915923</th>\n      <td>2021-01-10</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>6835</td>\n      <td>167.0</td>\n      <td>0.024433</td>\n    </tr>\n    <tr>\n      <th>919168</th>\n      <td>2021-01-11</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>6927</td>\n      <td>170.0</td>\n      <td>0.024542</td>\n    </tr>\n    <tr>\n      <th>922413</th>\n      <td>2021-01-12</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>7038</td>\n      <td>175.0</td>\n      <td>0.024865</td>\n    </tr>\n    <tr>\n      <th>925659</th>\n      <td>2021-01-13</td>\n      <td>Ulster</td>\n      <td>New York</td>\n      <td>36111.0</td>\n      <td>7107</td>\n      <td>175.0</td>\n      <td>0.024624</td>\n    </tr>\n  </tbody>\n</table>\n<p>312 rows × 7 columns</p>\n</div>",
+      "text/plain": "              date  county     state     fips  cases  deaths  case_to_death\n824     2020-03-08  Ulster  New York  36111.0      1     0.0       0.000000\n951     2020-03-09  Ulster  New York  36111.0      1     0.0       0.000000\n1102    2020-03-10  Ulster  New York  36111.0      1     0.0       0.000000\n1289    2020-03-11  Ulster  New York  36111.0      2     0.0       0.000000\n1526    2020-03-12  Ulster  New York  36111.0      4     0.0       0.000000\n...            ...     ...       ...      ...    ...     ...            ...\n912678  2021-01-09  Ulster  New York  36111.0   6677   165.0       0.024712\n915923  2021-01-10  Ulster  New York  36111.0   6835   167.0       0.024433\n919168  2021-01-11  Ulster  New York  36111.0   6927   170.0       0.024542\n922413  2021-01-12  Ulster  New York  36111.0   7038   175.0       0.024865\n925659  2021-01-13  Ulster  New York  36111.0   7107   175.0       0.024624\n\n[312 rows x 7 columns]"
+     },
+     "execution_count": 40,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "latest_df = nyt_covid_county_df.where(nyt_covid_county_df['county'] == 'Ulster').sort_values(by = [\"date\", \"cases\"], ascending = [False, False]).head(1)\n",
+    "\n",
+    "latest_df['cases']\n",
+    "\n",
+    "\n",
+    "nyt_covid_county_df.query('county ==  \"Ulster\"', inplace = False)\n",
+    "# filter = [nyt_covid_county_df['county'] == 'Ulster' & nyt_covid_county_df.cases == nyt_covid_county_df.cases.max()]\n",
+    "# print(nyt_covid_county_df[nyt_covid_county_df['county'] == 'Ulster' & nyt_covid_county_df.cases == nyt_covid_county_df.cases.max()]) "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 74,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "County population DF created\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Build the county population DF\n",
+    "county_pop_json = requests.get(county_pop_url)\n",
+    "\n",
+    "county_pop_df = build_df(county_pop_url, content_type='json')\n",
+    "county_build = False\n",
+    "if not county_pop_df.empty:\n",
+    "    print('County population DF created')\n",
+    "    county_build = True\n",
+    "else:\n",
+    "    print('County population DF failed to create')\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 75,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "name\n"
+     ]
+    }
+   ],
+   "source": [
+    "# drop the header row from the file; sett column names and cleanup data\n",
+    "if county_build:\n",
+    "    print(county_pop_df.head(1)[0][0].lower())# drop header row\n",
+    "    if county_pop_df[0][0].lower() == \"name\":\n",
+    "        county_pop_df.drop(county_pop_df.head(1).index, inplace = True)\n",
+    "    county_pop_df.columns = ['NAME', 'population', 'state_code', 'county_code']\n",
+    "    county_pop_df.drop('NAME', axis = 1, inplace = True)\n",
+    "    county_pop_df['fips'] = county_pop_df.state_code + county_pop_df.county_code\n",
+    "    # update the types to int64 and str\n",
+    "    county_pop_df = county_pop_df.astype({\n",
+    "    'population': 'int64',\n",
+    "    'state_code': 'int64',\n",
+    "    'county_code': 'str',\n",
+    "    'fips': 'int64'\n",
+    "})"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 77,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>population</th>\n      <th>state_code</th>\n      <th>county_code</th>\n      <th>fips</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>1</th>\n      <td>4198</td>\n      <td>35</td>\n      <td>023</td>\n      <td>35023</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>672391</td>\n      <td>34</td>\n      <td>017</td>\n      <td>34017</td>\n    </tr>\n    <tr>\n      <th>3</th>\n      <td>124371</td>\n      <td>34</td>\n      <td>019</td>\n      <td>34019</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>491845</td>\n      <td>34</td>\n      <td>027</td>\n      <td>34027</td>\n    </tr>\n    <tr>\n      <th>5</th>\n      <td>71367</td>\n      <td>35</td>\n      <td>031</td>\n      <td>35031</td>\n    </tr>\n    <tr>\n      <th>6</th>\n      <td>146748</td>\n      <td>35</td>\n      <td>043</td>\n      <td>35043</td>\n    </tr>\n    <tr>\n      <th>7</th>\n      <td>26998</td>\n      <td>35</td>\n      <td>017</td>\n      <td>35017</td>\n    </tr>\n    <tr>\n      <th>8</th>\n      <td>48954</td>\n      <td>35</td>\n      <td>009</td>\n      <td>35009</td>\n    </tr>\n    <tr>\n      <th>9</th>\n      <td>58460</td>\n      <td>35</td>\n      <td>015</td>\n      <td>35015</td>\n    </tr>\n    <tr>\n      <th>10</th>\n      <td>4521</td>\n      <td>35</td>\n      <td>033</td>\n      <td>35033</td>\n    </tr>\n  </tbody>\n</table>\n</div>",
+      "text/plain": "    population  state_code county_code   fips\n1         4198          35         023  35023\n2       672391          34         017  34017\n3       124371          34         019  34019\n4       491845          34         027  34027\n5        71367          35         031  35031\n6       146748          35         043  35043\n7        26998          35         017  35017\n8        48954          35         009  35009\n9        58460          35         015  35015\n10        4521          35         033  35033"
+     },
+     "execution_count": 77,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "county_pop_df.head(10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 116,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# merge population into county\n",
+    "# TODO population will be own table; FIPS as key\n",
+    "merged_county_df = pd.merge(left = merged_county_df, right = county_pop_df, left_on = 'fips', right_on = 'fips')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 66,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "RangeIndex(start=0, stop=3, step=1)\n",
+      "name\n",
+      "Index(['name', 'population', 'state_fips'], dtype='object')\n"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Write to S3"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 154,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# state_info_df.drop('population', axis = 1, inplace = True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 110,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# merge DF\n",
+    "merged_inner_df = pd.merge(left = nyt_covid_request_df, right = state_pop_df, left_on = 'fips', right_on = 'state_fips')\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 111,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>date</th>\n      <th>state</th>\n      <th>fips</th>\n      <th>cases</th>\n      <th>deaths</th>\n      <th>year</th>\n      <th>month</th>\n      <th>day</th>\n      <th>population</th>\n      <th>state_fips</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>2020-01-21</td>\n      <td>Washington</td>\n      <td>53</td>\n      <td>1</td>\n      <td>0</td>\n      <td>2020</td>\n      <td>1</td>\n      <td>21</td>\n      <td>7614893</td>\n      <td>53</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>2020-01-22</td>\n      <td>Washington</td>\n      <td>53</td>\n      <td>1</td>\n      <td>0</td>\n      <td>2020</td>\n      <td>1</td>\n      <td>22</td>\n      <td>7614893</td>\n      <td>53</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>2020-01-23</td>\n      <td>Washington</td>\n      <td>53</td>\n      <td>1</td>\n      <td>0</td>\n      <td>2020</td>\n      <td>1</td>\n      <td>23</td>\n      <td>7614893</td>\n      <td>53</td>\n    </tr>\n    <tr>\n      <th>3</th>\n      <td>2020-01-24</td>\n      <td>Washington</td>\n      <td>53</td>\n      <td>1</td>\n      <td>0</td>\n      <td>2020</td>\n      <td>1</td>\n      <td>24</td>\n      <td>7614893</td>\n      <td>53</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>2020-01-25</td>\n      <td>Washington</td>\n      <td>53</td>\n      <td>1</td>\n      <td>0</td>\n      <td>2020</td>\n      <td>1</td>\n      <td>25</td>\n      <td>7614893</td>\n      <td>53</td>\n    </tr>\n  </tbody>\n</table>\n</div>",
+      "text/plain": "        date       state  fips  cases  deaths  year  month  day  population  \\\n0 2020-01-21  Washington    53      1       0  2020      1   21     7614893   \n1 2020-01-22  Washington    53      1       0  2020      1   22     7614893   \n2 2020-01-23  Washington    53      1       0  2020      1   23     7614893   \n3 2020-01-24  Washington    53      1       0  2020      1   24     7614893   \n4 2020-01-25  Washington    53      1       0  2020      1   25     7614893   \n\n   state_fips  \n0          53  \n1          53  \n2          53  \n3          53  \n4          53  "
+     },
+     "execution_count": 111,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "merged_inner_df.columns\n",
+    "merged_inner_df.head(5)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# merged_inner_df = pd.merge(left = nyt_covid_request_df, right = state_pop_df, left_on = 'state', right_on = 'name')\n",
+    "print(f\"{merged_inner_df.dtypes} {merged_inner_df.columns}\")\n",
+    "merged_inner_df['population'] = merged_inner_df['POP'].astype(str).astype(int)\n",
+    "merged_inner_df.rename(columns = {\n",
+    "  'state_x': 'state'\n",
+    "}, inplace = True)\n",
+    "\n",
+    "print(f\"{merged_inner_df.dtypes} {merged_inner_df.columns}\")#  %% codecell\n",
+    "print(merged_inner_df.columns)# //merged_county_df.drop(['fips'], axis=1, inplace=True)\n",
+    "# merged_inner_df.drop(['POP', 'state_y'], axis = 1, inplace = True)# df['DataFrame Column'] = df['DataFrame Column'].astype(float)# merged_inner_df['cases_capita'] = merged_inner_df['cases_capita'].astype(float).round(2)\n",
+    "merged_inner_df['cases_capita'] = (merged_inner_df['cases'] / merged_inner_df['population']) * 100#(df['column_name'] / df['column_name'].sum()) * 100\n",
+    "\n",
+    "  #  %% codecell# cases per hundred thousands\n",
+    "one_hundred_thousand = 100000#(cases / population) * 100, 000\n",
+    "merged_inner_df['cases_hundred_thousand'] = (merged_inner_df['cases'] / merged_inner_df['population']) * one_hundred_thousand"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3.8.5 64-bit ('final': conda)",
+   "metadata": {
+    "interpreter": {
+     "hash": "864c03070d7c448c2f06e89960665620895ac1362af9f02f43fa7a1582f0a5b7"
+    }
+   },
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.5"
+  },
+  "orig_nbformat": 2
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
